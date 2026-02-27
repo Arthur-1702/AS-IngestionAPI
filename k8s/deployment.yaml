@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestionapi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ingestionapi
+  template:
+    metadata:
+      labels:
+        app: ingestionapi
+    spec:
+      containers:
+        - name: ingestionapi
+          image: arthur1702/ingestionapi:latest
+          env:
+            - name: TZ
+              value: "America/Sao_Paulo"
+          ports:
+            - containerPort: 80
