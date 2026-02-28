@@ -1,3 +1,6 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# RBAC — Prometheus precisa de permissão para descobrir pods via Kubernetes SD
+# ─────────────────────────────────────────────────────────────────────────────
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -30,6 +33,11 @@ subjects:
   - kind: ServiceAccount
     name: prometheus-ingestion
     namespace: default
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROMETHEUS — ConfigMap com scrape via anotações do pod
+# ─────────────────────────────────────────────────────────────────────────────
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -79,6 +87,10 @@ data:
           - source_labels: [__meta_kubernetes_pod_name]
             target_label: pod
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GRAFANA — datasource provisionado automaticamente (sem configuração manual)
+# ─────────────────────────────────────────────────────────────────────────────
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -277,6 +289,11 @@ data:
       ]
     }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PVCs — dados persistem entre reinicializações dos pods
+# CORRIGIDO: era emptyDir (dados perdidos a cada restart)
+# ─────────────────────────────────────────────────────────────────────────────
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -300,6 +317,10 @@ spec:
     requests:
       storage: 1Gi
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROMETHEUS — Deployment
+# ─────────────────────────────────────────────────────────────────────────────
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -317,9 +338,13 @@ spec:
         app: prometheus-ingestion
     spec:
       serviceAccountName: prometheus-ingestion
+      securityContext:
+        runAsUser: 65534 # nobody — usuário padrão da imagem prom/prometheus
+        runAsGroup: 65534
+        fsGroup: 65534 # garante que o PVC seja acessível pelo grupo do processo
       containers:
         - name: prometheus
-          image: prom/prometheus:v2.51.0
+          image: prom/prometheus:v2.51.0 # CORRIGIDO: era :latest
           ports:
             - containerPort: 9090
           args:
@@ -344,7 +369,7 @@ spec:
           configMap:
             name: prometheus-ingestion-config
         - name: data
-          persistentVolumeClaim:
+          persistentVolumeClaim: # CORRIGIDO: era emptyDir
             claimName: prometheus-pvc
 ---
 apiVersion: v1
@@ -359,8 +384,12 @@ spec:
     - protocol: TCP
       port: 9090
       targetPort: 9090
-  type: ClusterIP
+  type: ClusterIP # interno — Grafana acessa por nome de serviço, não precisa de IP público
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GRAFANA — Deployment
+# ─────────────────────────────────────────────────────────────────────────────
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -377,6 +406,10 @@ spec:
       labels:
         app: grafana-ingestion
     spec:
+      securityContext:
+        runAsUser: 472
+        runAsGroup: 472
+        fsGroup: 472
       containers:
         - name: grafana
           image: grafana/grafana:10.4.0
