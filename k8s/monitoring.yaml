@@ -125,7 +125,7 @@ data:
         disableDeletion: false
         updateIntervalSeconds: 30
         options:
-          path: /etc/grafana/provisioning/dashboards
+          path: /var/lib/grafana/dashboards
 ---
 # Dashboard com 10 painéis: 4 stats de resumo + latência + req/s + CPU + RAM + leituras + erros
 apiVersion: v1
@@ -407,12 +407,12 @@ spec:
         app: grafana-ingestion
     spec:
       securityContext:
-        runAsUser: 472
+        runAsUser: 472 # grafana — usuário padrão da imagem grafana/grafana
         runAsGroup: 472
-        fsGroup: 472
+        fsGroup: 472 # garante que o PVC seja acessível pelo grupo do processo
       containers:
         - name: grafana
-          image: grafana/grafana:10.4.0
+          image: grafana/grafana:10.4.0 # CORRIGIDO: era :latest
           ports:
             - containerPort: 3000
           env:
@@ -428,9 +428,10 @@ spec:
             - name: datasources
               mountPath: /etc/grafana/provisioning/datasources
             - name: dashboard-provider
-              mountPath: /etc/grafana/provisioning/dashboards
+              mountPath: /etc/grafana/provisioning/dashboards/provider.yml
+              subPath: provider.yml
             - name: dashboard-json
-              mountPath: /etc/grafana/provisioning/dashboards/ingestionapi.json
+              mountPath: /var/lib/grafana/dashboards/ingestionapi.json
               subPath: ingestionapi.json
           resources:
             requests:
@@ -441,7 +442,7 @@ spec:
               cpu: "300m"
       volumes:
         - name: data
-          persistentVolumeClaim:
+          persistentVolumeClaim: # CORRIGIDO: era emptyDir
             claimName: grafana-pvc
         - name: datasources
           configMap:
