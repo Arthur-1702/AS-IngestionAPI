@@ -1,152 +1,433 @@
----
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: prometheus-users
+  name: prometheus-ingestion
   namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: prometheus-users
+  name: prometheus-ingestion
 rules:
   - apiGroups: [""]
-    resources:
-      - nodes
-      - nodes/proxy
-      - services
-      - endpoints
-      - pods
-    verbs: ["get", "list", "watch"]
-  - apiGroups:
-      - extensions
-    resources:
-      - ingresses
-    verbs: ["get", "list", "watch"]
+    resources: [nodes, nodes/proxy, services, endpoints, pods]
+    verbs: [get, list, watch]
+  - apiGroups: [extensions]
+    resources: [ingresses]
+    verbs: [get, list, watch]
   - nonResourceURLs: ["/metrics"]
-    verbs: ["get"]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: prometheus-users
+  name: prometheus-ingestion
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: prometheus-users
+  name: prometheus-ingestion
 subjects:
   - kind: ServiceAccount
-    name: prometheus-users
+    name: prometheus-ingestion
     namespace: default
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: prometheus-users-config
+  name: prometheus-ingestion-config
+  namespace: default
 data:
   prometheus.yml: |
     global:
-      scrape_interval: 10s
+      scrape_interval: 15s
+      evaluation_interval: 15s
 
     scrape_configs:
-      - job_name: "ingestion-api"
+
+      - job_name: "prometheus"
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      # Descobre o pod pelo label app=ingestionapi
+      # e usa as anotações prometheus.io/* do deployment.yaml
+      - job_name: "ingestionapi"
         kubernetes_sd_configs:
           - role: pod
             namespaces:
-              names:
-                - default
+              names: [default]
         relabel_configs:
-          - source_labels: [__meta_kubernetes_pod_label_app]
+          # só scrapa pods com anotação prometheus.io/scrape: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
             action: keep
-            regex: ingestionapi
-          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: "true"
+          # monta o endereço com IP do pod + porta da anotação
+          - source_labels: [__meta_kubernetes_pod_ip, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: (.+);(.+)
+            replacement: $1:$2
             target_label: __address__
-            replacement: $1:8080
+          # path da anotação
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          # labels úteis para filtrar no Grafana
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: default
+data:
+  datasource.yml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus-ingestion-service:9090
+        isDefault: true
+        editable: false
+        jsonData:
+          httpMethod: POST
+          timeInterval: "15s"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: default
+data:
+  provider.yml: |
+    apiVersion: 1
+    providers:
+      - name: ingestionapi
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        options:
+          path: /etc/grafana/provisioning/dashboards
+---
+# Dashboard com 10 painéis: 4 stats de resumo + latência + req/s + CPU + RAM + leituras + erros
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-ingestionapi
+  namespace: default
+data:
+  ingestionapi.json: |
+    {
+      "title": "IngestionAPI — Métricas",
+      "uid": "ingestionapi-main",
+      "schemaVersion": 38,
+      "refresh": "30s",
+      "time": { "from": "now-1h", "to": "now" },
+      "tags": ["ingestionapi", "agromonitor"],
+      "panels": [
+        {
+          "id": 1, "type": "stat", "title": "Requisições/s",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+          "fieldConfig": { "defaults": { "unit": "reqps",
+            "color": { "mode": "thresholds" },
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "red", "value": 50 }
+            ]}}},
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+          "targets": [{
+            "expr": "sum(rate(http_requests_received_total{app=\"ingestionapi\"}[1m]))",
+            "legendFormat": "req/s",
+            "datasource": { "type": "prometheus", "uid": "prometheus" }
+          }]
+        },
+        {
+          "id": 2, "type": "stat", "title": "Taxa de Erro HTTP",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+          "fieldConfig": { "defaults": { "unit": "percentunit",
+            "color": { "mode": "thresholds" },
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.01 },
+              { "color": "red", "value": 0.05 }
+            ]}}},
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+          "targets": [{
+            "expr": "sum(rate(http_requests_received_total{app=\"ingestionapi\",code=~\"5..\"}[1m])) / sum(rate(http_requests_received_total{app=\"ingestionapi\"}[1m]))",
+            "legendFormat": "% erros",
+            "datasource": { "type": "prometheus", "uid": "prometheus" }
+          }]
+        },
+        {
+          "id": 3, "type": "stat", "title": "Latência p99",
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+          "fieldConfig": { "defaults": { "unit": "s",
+            "color": { "mode": "thresholds" },
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "red", "value": 2 }
+            ]}}},
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+          "targets": [{
+            "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{app=\"ingestionapi\"}[5m])) by (le))",
+            "legendFormat": "p99",
+            "datasource": { "type": "prometheus", "uid": "prometheus" }
+          }]
+        },
+        {
+          "id": 4, "type": "stat", "title": "Pods Ativos",
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+          "fieldConfig": { "defaults": { "unit": "short",
+            "color": { "mode": "thresholds" },
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]}}},
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+          "targets": [{
+            "expr": "count(up{app=\"ingestionapi\"} == 1)",
+            "legendFormat": "pods",
+            "datasource": { "type": "prometheus", "uid": "prometheus" }
+          }]
+        },
+        {
+          "id": 5, "type": "timeseries", "title": "Requisições HTTP por Status",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+          "fieldConfig": { "defaults": { "unit": "reqps",
+            "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }}},
+          "targets": [{
+            "expr": "sum(rate(http_requests_received_total{app=\"ingestionapi\"}[1m])) by (code)",
+            "legendFormat": "HTTP {{code}}",
+            "datasource": { "type": "prometheus", "uid": "prometheus" }
+          }]
+        },
+        {
+          "id": 6, "type": "timeseries", "title": "Latência HTTP — p50 / p95 / p99",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+          "fieldConfig": { "defaults": { "unit": "s",
+            "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }}},
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{app=\"ingestionapi\"}[5m])) by (le))",
+              "legendFormat": "p50", "datasource": { "type": "prometheus", "uid": "prometheus" }
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{app=\"ingestionapi\"}[5m])) by (le))",
+              "legendFormat": "p95", "datasource": { "type": "prometheus", "uid": "prometheus" }
+            },
+            {
+              "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{app=\"ingestionapi\"}[5m])) by (le))",
+              "legendFormat": "p99", "datasource": { "type": "prometheus", "uid": "prometheus" }
+            }
+          ]
+        },
+        {
+          "id": 7, "type": "timeseries", "title": "CPU — Pod ingestionapi",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+          "fieldConfig": { "defaults": { "unit": "percentunit",
+            "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 20 }}},
+          "targets": [{
+            "expr": "sum(rate(container_cpu_usage_seconds_total{pod=~\"ingestionapi.*\", container!=\"\"}[2m])) by (pod)",
+            "legendFormat": "{{pod}}",
+            "datasource": { "type": "prometheus", "uid": "prometheus" }
+          }]
+        },
+        {
+          "id": 8, "type": "timeseries", "title": "Memória — Pod ingestionapi",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+          "fieldConfig": { "defaults": { "unit": "bytes",
+            "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 20 }}},
+          "targets": [{
+            "expr": "sum(container_memory_working_set_bytes{pod=~\"ingestionapi.*\", container!=\"\"}) by (pod)",
+            "legendFormat": "{{pod}}",
+            "datasource": { "type": "prometheus", "uid": "prometheus" }
+          }]
+        },
+        {
+          "id": 9, "type": "timeseries", "title": "Leituras de Sensor Ingeridas",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+          "fieldConfig": { "defaults": { "unit": "short",
+            "custom": { "drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1 }}},
+          "targets": [{
+            "expr": "sum(rate(ingestion_readings_total{app=\"ingestionapi\"}[1m]))",
+            "legendFormat": "leituras/s",
+            "datasource": { "type": "prometheus", "uid": "prometheus" }
+          }]
+        },
+        {
+          "id": 10, "type": "timeseries", "title": "Erros de Ingestão",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+          "fieldConfig": { "defaults": { "unit": "short",
+            "color": { "fixedColor": "red", "mode": "fixed" },
+            "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }}},
+          "targets": [{
+            "expr": "sum(rate(ingestion_readings_total{app=\"ingestionapi\", result=\"error\"}[5m]))",
+            "legendFormat": "erros/s",
+            "datasource": { "type": "prometheus", "uid": "prometheus" }
+          }]
+        }
+      ]
+    }
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-pvc
+  namespace: default
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-pvc
+  namespace: default
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: prometheus-users
+  name: prometheus-ingestion
+  namespace: default
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: prometheus-users
+      app: prometheus-ingestion
   template:
     metadata:
       labels:
-        app: prometheus-users
+        app: prometheus-ingestion
     spec:
-      serviceAccountName: prometheus-users
+      serviceAccountName: prometheus-ingestion
       containers:
         - name: prometheus
-          image: prom/prometheus:latest
+          image: prom/prometheus:v2.51.0
           ports:
             - containerPort: 9090
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--storage.tsdb.retention.time=15d"
+            - "--web.enable-lifecycle"
           volumeMounts:
             - name: config
               mountPath: /etc/prometheus
             - name: data
               mountPath: /prometheus
-          args:
-            - "--config.file=/etc/prometheus/prometheus.yml"
-            - "--storage.tsdb.path=/prometheus"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
       volumes:
         - name: config
           configMap:
-            name: prometheus-users-config
+            name: prometheus-ingestion-config
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: prometheus-pvc
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: prometheus-users-service
+  name: prometheus-ingestion-service
+  namespace: default
 spec:
   selector:
-    app: prometheus-users
+    app: prometheus-ingestion
   ports:
     - protocol: TCP
       port: 9090
       targetPort: 9090
-  type: LoadBalancer
+  type: ClusterIP
+
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: grafana-users
+  name: grafana-ingestion
+  namespace: default
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: grafana-users
+      app: grafana-ingestion
   template:
     metadata:
       labels:
-        app: grafana-users
+        app: grafana-ingestion
     spec:
       containers:
         - name: grafana
-          image: grafana/grafana:latest
+          image: grafana/grafana:10.4.0
           ports:
             - containerPort: 3000
           env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: "admin"
             - name: GF_SECURITY_ADMIN_PASSWORD
               value: "admin"
+            - name: GF_USERS_ALLOW_SIGN_UP
+              value: "false"
           volumeMounts:
             - name: data
               mountPath: /var/lib/grafana
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboard-json
+              mountPath: /etc/grafana/provisioning/dashboards/ingestionapi.json
+              subPath: ingestionapi.json
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "300m"
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: grafana-pvc
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: grafana-dashboard-provider
+        - name: dashboard-json
+          configMap:
+            name: grafana-dashboard-ingestionapi
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: grafana-users-service
+  name: grafana-ingestion-service
+  namespace: default
 spec:
   selector:
-    app: grafana-users
+    app: grafana-ingestion
   ports:
     - protocol: TCP
       port: 3000
